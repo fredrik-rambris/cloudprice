@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -68,7 +69,7 @@ public class AWSFetcher
 					i.put("vCPU", Integer.parseInt(sizeObject.get("vCPU").getAsString()));
 					i.put("memoryGiB", Float.parseFloat(sizeObject.get("memoryGiB").getAsString()));
 					i.put("price", new BigDecimal(sizeObject.get("valueColumns").getAsJsonArray().get(0).getAsJsonObject().getAsJsonObject("prices").get("USD").getAsString()));
-					System.out.println(i);
+					System.out.println(new Gson().toJson(i));
 				}
 			}
 		}
