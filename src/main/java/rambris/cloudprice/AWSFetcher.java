@@ -1,5 +1,8 @@
 package rambris.cloudprice;
 
+import static com.mongodb.client.model.Filters.and;
+import static com.mongodb.client.model.Filters.eq;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringWriter;
@@ -7,24 +10,30 @@ import java.math.BigDecimal;
 import java.net.URL;
 import java.net.URLConnection;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
+import org.bson.Document;
+import org.bson.conversions.Bson;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.mongodb.MongoClient;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.UpdateOptions;
 
 public class AWSFetcher
 {
 	protected String[] uris;
+	protected MongoClient mongoClient=new MongoClient();
+	protected MongoDatabase db=null;
+	protected MongoCollection<Document> instances;
 	
 	public static String HTTPGet(String url) throws IOException, IOException
 	{
@@ -42,13 +51,50 @@ public class AWSFetcher
 	
 	public void init() throws IOException
 	{
+		db = mongoClient.getDatabase("cloudprice");
+		instances = db.getCollection("instances");
 		uris=fetchURIsToJSONs();		
+		fetchPrices();
+		
+	}
+	
+	private void updateInstance(Document instance)
+	{
+		Bson key=and(eq("baseName", instance.get("baseName")), eq("region", instance.get("region")), eq("size", instance.get("size")));
+		instances.updateOne(key, new Document("$set", instance), new UpdateOptions().upsert(true));
+	}
+	
+	public void fetchPrices() throws IOException
+	{
+		for(String search:new String[]{".*linux-od.*",".*mswin-od.*",".*mswinSQL-od.*",".*mswinSQLEnterprise-od.*"})
+		{
+			String uri=findURI(search);
+			if(uri!=null)
+			{
+				System.out.println(uri);
+				JsonElement json=fetchCallback(uri);
+				for(Document instance:parseInstances(json))
+				{
+					updateInstance(instance);
+				}
+			}			
+		}
+	}
+	
+	public String findURI(String search)
+	{
+		Pattern p=Pattern.compile(search);
+		for(String uri:uris)
+		{
+			Matcher m=p.matcher(uri);
+			if(m.matches()) return uri;
+		}
+		return null;
 	}
 
-	public void getSomething() throws IOException
+	public List<Document> parseInstances(JsonElement root) throws IOException
 	{
-		JsonElement root=fetchCallback(uris[0]);
-		String baseName=FilenameUtils.getBaseName(FilenameUtils.getBaseName(uris[0]));
+		List<Document> retVal=new LinkedList<Document>();
 		JsonArray regions=root.getAsJsonObject().getAsJsonObject("config").get("regions").getAsJsonArray();
 		for(JsonElement regelement:regions)
 		{
@@ -61,18 +107,21 @@ public class AWSFetcher
 				for(JsonElement sizeElement:typeObject.get("sizes").getAsJsonArray())
 				{
 					JsonObject sizeObject=sizeElement.getAsJsonObject();
-					Map<String,Object> i=new HashMap<String,Object>();
-					i.put("baseName", baseName);
+					Document i=new Document();
+					i.put("baseName", sizeObject.get("valueColumns").getAsJsonArray().get(0).getAsJsonObject().get("name").getAsString());
 					i.put("region", regionName);
 					i.put("instanceType", instanceType);
 					i.put("size", sizeObject.get("size").getAsString());
 					i.put("vCPU", Integer.parseInt(sizeObject.get("vCPU").getAsString()));
 					i.put("memoryGiB", Float.parseFloat(sizeObject.get("memoryGiB").getAsString()));
-					i.put("price", new BigDecimal(sizeObject.get("valueColumns").getAsJsonArray().get(0).getAsJsonObject().getAsJsonObject("prices").get("USD").getAsString()));
-					System.out.println(new Gson().toJson(i));
+					BigDecimal price=new BigDecimal(sizeObject.get("valueColumns").getAsJsonArray().get(0).getAsJsonObject().getAsJsonObject("prices").get("USD").getAsString());
+					price=price.multiply(new BigDecimal(10000));
+					i.put("price", price.intValue());
+					retVal.add(i);
 				}
 			}
 		}
+		return retVal;
 	}
 	
 	public class InstanceInfo
@@ -106,8 +155,6 @@ public class AWSFetcher
 		}
 		return null;
 	}
-	
-	
 	
 	private static Pattern modelPattern=Pattern.compile("model\\s*:\\s*'(.*pricing.*)'", Pattern.MULTILINE);
 	public String[] fetchURIsToJSONs() throws IOException

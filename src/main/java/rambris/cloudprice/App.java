@@ -12,6 +12,5 @@ public class App
     {
         AWSFetcher f=new AWSFetcher();
         f.init();
-        f.getSomething();
     }
 }
