@@ -1,6 +1,8 @@
 package rambris.cloudprice;
 
-import static com.mongodb.client.model.Filters.*;
+import static com.mongodb.client.model.Filters.and;
+import static com.mongodb.client.model.Filters.eq;
+import static com.mongodb.client.model.Filters.gte;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -47,6 +49,7 @@ public class App implements Closeable
     	Options opts=new Options();
     	opts.addOption("c", "cpu", true, "Number of vCPU");
     	opts.addOption("r", "ram", true, "GiB of RAM");
+    	opts.addOption("d", "disk", true, "GiB of disk");
     	opts.addOption("u", "update", false, "Update prices");
     	opts.addOption("r", "region", true, "Region");
     	opts.addOption("t", "type", true, "Type of instance");
@@ -61,6 +64,7 @@ public class App implements Closeable
     	{
     		HelpFormatter help=new HelpFormatter();
     		help.printHelp("cloudprice [OPTIONS]", opts);
+    		return;
     	}
     	if(cline.hasOption("update"))
     	{
@@ -85,7 +89,7 @@ public class App implements Closeable
     	}
     	else
     	{
-    		int cpu=0, ram=0;
+    		int cpu=0, ram=0, disk=0;
     		if(cline.hasOption("cpu"))
     		{
     			cpu=Integer.parseInt(cline.getOptionValue("cpu"));
@@ -94,24 +98,47 @@ public class App implements Closeable
     		{
     			ram=Integer.parseInt(cline.getOptionValue("ram"));
     		}
+    		if(cline.hasOption("disk"))
+    		{
+    			disk=Integer.parseInt(cline.getOptionValue("disk"));
+    		}
     		String region=cline.getOptionValue("region");
     		String type=cline.getOptionValue("type");
 
-    		try(App app=new App())
+    		if(region!=null || type!=null || cpu>0 || ram>0 || disk>0)
     		{
-    			app.listInstances(region, type, cpu, ram);
+	    		try(App app=new App())
+	    		{
+	    			app.listInstances(region, type, cpu, ram, disk);
+	    		}
     		}
     	}
     }
     
-    private void listInstances(String region, String type, int cpu, int ram)
+    private double getMonthlyDiskPrice(String region)
+    {
+		Vector<Bson> filters=new Vector<Bson>();
+		filters.add(eq("name", "Amazon EBS General Purpose (SSD) volumes"));
+		if(region!=null) filters.add(eq("region", region));
+
+		for(Document doc:storage.find(and(filters)).sort(new Document("price", 1)).limit(1))
+    	{
+    		return (double)doc.getInteger("price")/10000.0;
+    	}
+    	return 0;
+    }
+    
+    private void listInstances(String region, String type, int cpu, int ram, int disk)
 	{
+    	double diskPrice=0;
+    	if(disk>0) diskPrice=getMonthlyDiskPrice(region)*(double)disk;
+ 
 		System.out.println("Region          | Class                | Type         | vCPU | RAM   | Price");
 		System.out.println("----------------+----------------------+--------------+------+-------+------");
 		Vector<Bson> filters=new Vector<Bson>();
 		if(region!=null) filters.add(eq("region", region));
 		if(type!=null) filters.add(eq("baseName", type));
-		if(cpu>0) filters.add(gt("vCPU", cpu));
+		if(cpu>0) filters.add(gte("vCPU", cpu));
 		if(ram>0) filters.add(gte("memoryGiB", ram));
 
 		FindIterable<Document>result;
@@ -126,9 +153,9 @@ public class App implements Closeable
 		}
 		
 		/* and(eq("region", region), eq("baseName", type)) */
-    	for(Document doc:result)
+    	for(Document doc:result.limit(10))
     	{
-    		System.out.printf("%-15s | %-20s | %-12s | %4d | %5.1f | %.03f%n", doc.get("region"), doc.get("baseName"), doc.get("size"), doc.get("vCPU"), doc.get("memoryGiB"), doc.getInteger("price")/10000.0f);
+    		System.out.printf("%-15s | %-20s | %-12s | %4d | %5.1f | %.03f%n", doc.get("region"), doc.get("baseName"), doc.get("size"), doc.get("vCPU"), doc.get("memoryGiB"), (doc.getInteger("price")/10000.0f*720.0f)+diskPrice);
     	}
 	}
 
