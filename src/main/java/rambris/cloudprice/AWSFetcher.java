@@ -3,6 +3,7 @@ package rambris.cloudprice;
 import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringWriter;
@@ -15,6 +16,7 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 import org.bson.Document;
 import org.bson.conversions.Bson;
@@ -28,13 +30,21 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.UpdateOptions;
 
-public class AWSFetcher
+public class AWSFetcher implements Closeable
 {
 	protected String[] uris;
 	protected MongoClient mongoClient=new MongoClient();
 	protected MongoDatabase db=null;
 	protected MongoCollection<Document> instances;
+	protected MongoCollection<Document> storage;
 	
+	/**
+	 * Basic HTTP client
+	 * @param url
+	 * @return
+	 * @throws IOException
+	 * @throws IOException
+	 */
 	public static String HTTPGet(String url) throws IOException, IOException
 	{
 		URLConnection conn = new URL(url).openConnection();
@@ -45,42 +55,85 @@ public class AWSFetcher
 		return str.toString();
 	}
 
-	public AWSFetcher()
+	public AWSFetcher() throws IOException
 	{
+		init();
 	}
 	
 	public void init() throws IOException
 	{
 		db = mongoClient.getDatabase("cloudprice");
 		instances = db.getCollection("instances");
-		uris=fetchURIsToJSONs();		
-		fetchPrices();
+		storage = db.getCollection("storage");
 		
 	}
 	
+	public void close()
+	{
+		mongoClient.close();
+	}
+	
+	/**
+	 * Send instance document to MongoDB
+	 * @param instance
+	 */
 	private void updateInstance(Document instance)
 	{
 		Bson key=and(eq("baseName", instance.get("baseName")), eq("region", instance.get("region")), eq("size", instance.get("size")));
 		instances.updateOne(key, new Document("$set", instance), new UpdateOptions().upsert(true));
 	}
-	
+
+	/**
+	 * Send EBS document to MongoDB
+	 * @param instance
+	 */
+	private void updateEBS(Document instance)
+	{
+		Bson key=and(eq("name", instance.get("name")), eq("region", instance.get("region")), eq("rate", instance.get("rate")));
+		storage.updateOne(key, new Document("$set", instance), new UpdateOptions().upsert(true));
+	}
+
+	/**
+	 * Main function that fetches all info from AWS
+	 * @throws IOException
+	 */
 	public void fetchPrices() throws IOException
 	{
+		uris=fetchURIsToJSONs();		
+
 		for(String search:new String[]{".*linux-od.*",".*mswin-od.*",".*mswinSQL-od.*",".*mswinSQLEnterprise-od.*"})
 		{
 			String uri=findURI(search);
 			if(uri!=null)
 			{
-				System.out.println(uri);
+				System.out.println("Fetching " + FilenameUtils.getBaseName(uri));
 				JsonElement json=fetchCallback(uri);
 				for(Document instance:parseInstances(json))
 				{
 					updateInstance(instance);
 				}
+			}
+		}
+		for(String search:new String[]{".*pricing-ebs.min.*"})
+		{
+			String uri=findURI(search);
+			if(uri!=null)
+			{
+				System.out.println("Fetching " + FilenameUtils.getBaseName(uri));
+				JsonElement json=fetchCallback(uri);
+				for(Document instance:parseEBS(json))
+				{
+					updateEBS(instance);
+				}
 			}			
 		}
 	}
 	
+	/**
+	 * Loop through fetched URIs and return the first one that matches
+	 * @param search
+	 * @return
+	 */
 	public String findURI(String search)
 	{
 		Pattern p=Pattern.compile(search);
@@ -92,6 +145,12 @@ public class AWSFetcher
 		return null;
 	}
 
+	/**
+	 * Parse JSON and extract instance info
+	 * @param root
+	 * @return
+	 * @throws IOException
+	 */
 	public List<Document> parseInstances(JsonElement root) throws IOException
 	{
 		List<Document> retVal=new LinkedList<Document>();
@@ -108,13 +167,14 @@ public class AWSFetcher
 				{
 					JsonObject sizeObject=sizeElement.getAsJsonObject();
 					Document i=new Document();
+					i.put("source", "aws");
 					i.put("baseName", sizeObject.get("valueColumns").getAsJsonArray().get(0).getAsJsonObject().get("name").getAsString());
 					i.put("region", regionName);
 					i.put("instanceType", instanceType);
 					i.put("size", sizeObject.get("size").getAsString());
 					i.put("vCPU", Integer.parseInt(sizeObject.get("vCPU").getAsString()));
 					i.put("memoryGiB", Float.parseFloat(sizeObject.get("memoryGiB").getAsString()));
-					BigDecimal price=new BigDecimal(sizeObject.get("valueColumns").getAsJsonArray().get(0).getAsJsonObject().getAsJsonObject("prices").get("USD").getAsString());
+					BigDecimal price=sizeObject.get("valueColumns").getAsJsonArray().get(0).getAsJsonObject().getAsJsonObject("prices").get("USD").getAsBigDecimal();
 					price=price.multiply(new BigDecimal(10000));
 					i.put("price", price.intValue());
 					retVal.add(i);
@@ -123,19 +183,45 @@ public class AWSFetcher
 		}
 		return retVal;
 	}
-	
-	public class InstanceInfo
+
+	public List<Document> parseEBS(JsonElement root) throws IOException
 	{
-		String region;
-		String name;
-		int vCPU;
-		int memory;
-		String os;
-		BigDecimal price;
+		List<Document> retVal=new LinkedList<Document>();
+		JsonArray regions=root.getAsJsonObject().getAsJsonObject("config").get("regions").getAsJsonArray();
+		for(JsonElement regelement:regions)
+		{
+			JsonObject region=regelement.getAsJsonObject();
+			String regionName=region.get("region").getAsString();
+			for(JsonElement typeElement:region.get("types").getAsJsonArray())
+			{
+				JsonObject typeObject=typeElement.getAsJsonObject();
+				Document i=new Document();
+				i.put("source", "aws");
+				i.put("name", typeObject.get("name").getAsString());
+				i.put("region", regionName);
+				for(JsonElement valueElement:typeObject.get("values").getAsJsonArray())
+				{
+					JsonObject valueObject=valueElement.getAsJsonObject();
+					BigDecimal price=valueObject.getAsJsonObject("prices").get("USD").getAsBigDecimal();
+					price=price.multiply(new BigDecimal(10000));
+					i.put("price", price.intValue());
+					i.put("rate", valueObject.get("rate").getAsString());
+					retVal.add(i);
+				}
+			}
+		}
+		return retVal;
 	}
 	
 	private static Pattern callbackPattern=Pattern.compile("callback\\((.*)\\);");
 	private static Pattern keyPattern=Pattern.compile("(\\w+):");
+
+	/**
+	 * Fetch JSONP, convert it to JSON and return parsed JSON
+	 * @param uri
+	 * @return
+	 * @throws IOException
+	 */
 	public JsonElement fetchCallback(String uri) throws IOException
 	{
 		String page=HTTPGet(uri);
@@ -157,6 +243,12 @@ public class AWSFetcher
 	}
 	
 	private static Pattern modelPattern=Pattern.compile("model\\s*:\\s*'(.*pricing.*)'", Pattern.MULTILINE);
+
+	/**
+	 * Search EC2 pricing and search for URIs
+	 * @return
+	 * @throws IOException
+	 */
 	public String[] fetchURIsToJSONs() throws IOException
 	{
 		List<String> uris=new ArrayList<String>();
@@ -164,6 +256,7 @@ public class AWSFetcher
 		Matcher m=modelPattern.matcher(page);
 		while(m.find())
 		{
+			//System.out.println("http:"+m.group(1));
 			if(m.group(1).startsWith("//")) uris.add("http:"+m.group(1));
 			else uris.add(m.group(1));
 		}
